@@ -4,12 +4,38 @@ import { type ApiConfig } from "../config";
 import type { BunRequest } from "bun";
 import { BadRequestError } from "./errors";
 import { getBearerToken, validateJWT } from "../auth";
-import { getVideo, updateVideo } from "../db/videos";
+import { getVideo, updateVideo, type Video } from "../db/videos";
 import { randomBytes } from "node:crypto";
 
 const VIDEO_MIME_TO_EXTENSION: Record<string, string> = {
   "video/mp4": "mp4",
 };
+
+async function processVideoForFastStart(inputFilePath: string) {
+  const processedFilePath = `${inputFilePath}.processed`;
+  const proc = Bun.spawn([
+    "ffmpeg",
+    "-i",
+    inputFilePath,
+    "-movflags",
+    "faststart",
+    "-map_metadata",
+    "0",
+    "-codec",
+    "copy",
+    "-f",
+    "mp4",
+    processedFilePath
+  ])
+
+  await proc.exited;
+  if (proc.exitCode != 0) {
+    const stderrText = await new Response(proc.stderr).text();
+    throw new BadRequestError(`Invalid video file, issue processing for fast start: ${stderrText}`);
+  }
+
+  return processedFilePath;
+}
 
 async function getVideoAspectRatio(filePath: string) {
   const proc = Bun.spawn([
@@ -47,6 +73,21 @@ async function getVideoAspectRatio(filePath: string) {
   } else {
     return "other";
   }
+}
+
+async function generatePresignedURL(cfg: ApiConfig, key: string, expireTime: number) {
+  return cfg.s3Client.presign(key, {
+    expiresIn: expireTime
+  });
+}
+
+export async function dbVideoToSignedVideo(cfg: ApiConfig, video: Video) {
+  if (!video.videoURL) {
+    return { ...video };
+  }
+
+  const signedVideoURL = await generatePresignedURL(cfg, video.videoURL, 900); // 15 minutes
+  return { ...video, videoURL: signedVideoURL };
 }
 
 export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
@@ -92,22 +133,29 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   await Bun.write(savePath, file);
   const prefix = await getVideoAspectRatio(savePath);
 
+  // Process it for fast start
+  const newSavePath = await processVideoForFastStart(savePath);
+
   // Create s3 file and write from the temporary file
   const s3File = cfg.s3Client.file(`/${prefix}/${filename}`);
-  await s3File.write(Bun.file(savePath), {
+  await s3File.write(Bun.file(newSavePath), {
     type: file.type,
   });
 
-  // Delete the temporary file
+  // Delete the temporary files
   await Bun.file(savePath).delete();
+  await Bun.file(newSavePath).delete();
 
   // Update the video record with the S3 URL
-  const videoURL = new URL(`https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${prefix}/${filename}`).toString();
+  // const videoURL = new URL(`https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${prefix}/${filename}`).toString();
+  const videoURL = `${prefix}/${filename}`;
   updateVideo(cfg.db, {
     ...video,
     videoURL,
   });
 
-  return respondWithJSON(200, getVideo(cfg.db, videoId));
+  const updatedVideo = {...video, videoURL};
+  const presignedVideo = await dbVideoToSignedVideo(cfg, updatedVideo);
+  return respondWithJSON(200, presignedVideo);
 }
 
