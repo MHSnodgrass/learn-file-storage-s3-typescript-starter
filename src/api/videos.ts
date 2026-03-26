@@ -75,21 +75,6 @@ async function getVideoAspectRatio(filePath: string) {
   }
 }
 
-async function generatePresignedURL(cfg: ApiConfig, key: string, expireTime: number) {
-  return cfg.s3Client.presign(key, {
-    expiresIn: expireTime
-  });
-}
-
-export async function dbVideoToSignedVideo(cfg: ApiConfig, video: Video) {
-  if (!video.videoURL) {
-    return { ...video };
-  }
-
-  const signedVideoURL = await generatePresignedURL(cfg, video.videoURL, 900); // 15 minutes
-  return { ...video, videoURL: signedVideoURL };
-}
-
 export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   const { videoId } = req.params as { videoId?: string };
   if (!videoId) {
@@ -146,16 +131,14 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   await Bun.file(savePath).delete();
   await Bun.file(newSavePath).delete();
 
-  // Update the video record with the S3 URL
-  // const videoURL = new URL(`https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${prefix}/${filename}`).toString();
-  const videoURL = `${prefix}/${filename}`;
+  // Update the video record with the CloudFront domain
+  const videoURL = `${cfg.s3CfDistribution}/${prefix}/${filename}`;
   updateVideo(cfg.db, {
     ...video,
     videoURL,
   });
 
   const updatedVideo = {...video, videoURL};
-  const presignedVideo = await dbVideoToSignedVideo(cfg, updatedVideo);
-  return respondWithJSON(200, presignedVideo);
+  return respondWithJSON(200, updatedVideo);
 }
 
